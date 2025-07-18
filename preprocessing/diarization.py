@@ -50,8 +50,8 @@ if __name__ == "__main__":
     #     save_asr_result(MSDWILD_PATH+f'/{str(f).zfill(5)}.wav')
     # ami_list = os.listdir("amicorpus")
     
-    # save_asr_result('trump.wav')
-    # save_sd_result('trump.wav')
+    save_asr_result('trump.wav')
+    save_sd_result('trump.wav')
     
     asr_json_path = os.path.join("data/asr/trump.json")
     sd_json_path = os.path.join("data/sd/trump.json")

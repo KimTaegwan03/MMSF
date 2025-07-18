@@ -64,15 +64,16 @@ class MoE(nn.Module):
         expert_outputs = []
         for expert in self.experts:
             expert_outputs.append(expert(x))
-        expert_outputs = torch.stack(expert_outputs, dim=1)
+        expert_outputs = torch.stack(expert_outputs, dim=2)
         
         # Combine expert outputs
         selected_outputs = torch.gather(
             expert_outputs,
-            1,
-            top_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
+            2,
+            top_indices.unsqueeze(-1).expand(-1, -1, -1, expert_outputs.size(-1))
         )
-        output = torch.sum(selected_outputs * top_weights.unsqueeze(-1), dim=1)
+
+        output = torch.sum(selected_outputs * top_weights.unsqueeze(-1), dim=2)
         
         return output
     
@@ -145,16 +146,21 @@ class VideoUniGraph(nn.Module):
             # for _ in range(num_layers-1)
         ])
         
-        self.decoder = VolatilityDecoder(hidden_dim)
-        
+        self.decoder = nn.ModuleDict([[
+            modal, VolatilityDecoder(hidden_dim*4)  # Assuming 4 heads in GATConv
+        ] for modal in self.modals])
+
         # SPD decoder
         self.spd_decoder = SPDDecoder(hidden_dim)
         
         # Mask token
-        self.mask_token = nn.Parameter(torch.randn(hidden_dim)).to(self.device)
+        self.mask_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
         
-        # Global Vertex
-        self.global_vertex = nn.Parameter(torch.randn(1,hidden_dim)).to(self.device)
+        # Conv Vertex
+        self.x_hie_conv_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
+
+        # Speaker Vertex
+        self.x_hie_speaker_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
 
     def construct_conversation_graph(
         self,
@@ -223,6 +229,7 @@ class VideoUniGraph(nn.Module):
     def forward(
         self,
         features: Dict[str, torch.Tensor],
+        graph: Data,  # Graph data structure
         # spmap: List,
         spd_matrix: Optional[torch.Tensor] = None,
         return_embeddings: bool = False
@@ -242,23 +249,34 @@ class VideoUniGraph(nn.Module):
         # Apply MoE
         aligned_x = self.moe(masked_x)
         
-        graph = self.construct_conversation_graph(aligned_x, self.K)
-        
+        # graph = self.construct_conversation_graph(aligned_x, self.K)
+
         # Apply GNN layers
-        h = graph.x
+        x_hie_conv = self.x_hie_conv_token.unsqueeze(0).repeat(graph.x_hie_conv.size(0), 1)      # [hie_conv_count, 768]
+        x_hie_speaker = self.x_hie_speaker_token.unsqueeze(0).repeat(graph.x_hie_speaker.size(0), 1)  # [hie_speaker_count, 768]
+
+        h = torch.concat([aligned_x,x_hie_conv.unsqueeze(1),x_hie_speaker.unsqueeze(1)], dim=0).squeeze(1)
+
+        print("Initial h shape:", h.shape)
+
         for layer in self.gnn_layers:
-            print(h.shape)
             h = layer(h, graph.edge_index)
-            
-        h = h.mean(dim=1)
+        
+        print("After GNN layers, h shape:", h.shape)
+
+        res = {
+                "conversation_embeddings": h[:aligned_x.size(0),:],  # Exclude hierarchical nodes
+                "global_embeddings": h[graph.global_index[0]:graph.global_index[0]+1,:], # Global node embedding
+                "speaker_embeddings": h[graph.speaker_index,:]
+            }
             
         if return_embeddings:
-            return h
+            return res
             
         # Reconstruct features for each domain
         reconstruction_loss = 0
         for domain, decoder in self.decoder.items():
-            reconstructed = decoder(h[mask])
+            reconstructed = decoder(h[:aligned_x.size(0),:][mask])
             original = features[domain][mask]
             similarity = F.cosine_similarity(reconstructed, original, dim=-1)
             reconstruction_loss += (1 - similarity).pow(self.gamma).mean()
@@ -271,4 +289,35 @@ class VideoUniGraph(nn.Module):
         # Combine losses
         total_loss = reconstruction_loss + self.lambda_spd * spd_loss
         
-        return total_loss, h 
+        return total_loss, res
+
+
+if __name__ == "__main__":
+    model = VideoUniGraph(
+        input_dims={
+            "text": 768,
+            "video": 768,
+            "audio": 768
+        },
+        device='cpu'
+    )
+
+
+    graph = torch.load('data/graph/trump_single.pt',map_location=torch.device('cpu'))
+
+    # Print datatypes and shapes of graph features
+    print("x_text dtype:", graph.x_text.dtype, "\tshape:", graph.x_text.shape)
+    print("x_video dtype:", graph.x_video.dtype, "\tshape:", graph.x_video.shape)
+    print("x_audio dtype:", graph.x_audio.dtype, "\tshape:", graph.x_audio.shape)
+
+    pred = model.forward(
+        features={
+            "text": graph.x_text,
+            "video": graph.x_video,
+            "audio": graph.x_audio.to(torch.float32)
+        },
+        graph=graph,
+        return_embeddings=False
+    )
+
+    print(pred)
