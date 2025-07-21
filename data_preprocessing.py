@@ -82,6 +82,79 @@ def build_tree_edge_index(num_nodes, branch_factor,level_edge=True):
     edge_index = torch.tensor(edges, dtype=torch.long).t()
     return edge_index
 
+
+def build_tree_edge_index_log(num_nodes, num_leaves, branch_factor):
+    """
+    로그 트리 구조의 edge_index를 생성합니다.
+    
+    Args:
+        num_nodes (int): 노드의 총 개수
+        branch_factor (int): 각 노드가 가질 자식 노드의 개수
+
+    Returns:
+        torch.Tensor: edge_index 텐서
+    """
+    if branch_factor < 1:
+        raise ValueError("branch_factor는 1 이상이어야 합니다.")
+    if num_nodes < 2:
+        raise ValueError("노드 수는 최소 2개 이상이어야 트리 구조가 가능합니다.")
+
+    # 1. 트리 depth 계산
+    depth = 1
+    total = num_nodes
+    curr = num_nodes
+    while curr > 1:
+        curr = (curr + branch_factor - 1) // branch_factor
+        depth += 1
+
+    print("Depth:", depth, "Total Nodes:", total)
+
+    # 실제 생성 가능한 노드 수를 초과한 경우, 마지막 층 일부는 잘릴 수 있음
+    level_nodes = [[] for _ in range(depth)]
+    node_id = 0
+    count = (num_leaves + branch_factor - 1) // branch_factor
+    for d in range(depth,0,-1):
+        print(f"Depth {d}")
+        layer = []
+        for _ in range(count):
+            print(f"node_id {node_id}")
+            if node_id >= num_nodes:
+                break
+            layer.append(node_id)
+            node_id += 1
+        level_nodes[d-1] = layer
+        count = (count + branch_factor - 1) // branch_factor
+        if node_id >= num_nodes:
+            break
+
+    print(level_nodes)
+
+    edges = []
+    for l in range(len(level_nodes) - 1):
+        parents = level_nodes[l]
+        children = level_nodes[l + 1]
+        for i, p in enumerate(parents):
+            if i != 0:
+                edges.append((p, parents[i - 1]))
+                edges.append((parents[i - 1], p))
+            for j in range(branch_factor):
+                c_index = i * branch_factor + j
+                if c_index < len(children):
+                    edges.append((p, children[c_index]))
+                    edges.append((children[c_index], p))
+
+    # 마지막 층의 노드가 부족한 경우, 마지막 층의 노드끼리 연결
+    if len(level_nodes[-1]) > 1:
+        last_layer = level_nodes[-1]
+        for i in range(len(last_layer) - 1):
+            edges.append((last_layer[i], last_layer[i + 1]))
+            edges.append((last_layer[i + 1], last_layer[i]))
+
+    # 3. edge_index 반환
+    edge_index = torch.tensor(edges, dtype=torch.long).t()
+    return edge_index
+    
+
 def convert_webm_to_mp4(video_path, converted_video_path):
     """OpenCV를 사용하여 WebM을 MP4로 변환"""
     # print("WebM을 MP4로 변환 중...")
@@ -205,6 +278,7 @@ class TextFeatureExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         self.model = AutoModel.from_pretrained('bert-base-uncased')
         self.model.to(device)
+        self.model.half()
 
     def encode(self, text:str):
         # 토큰화 및 텐서 변환
@@ -212,7 +286,7 @@ class TextFeatureExtractor:
 
         # 모델을 통해 임베딩 추출
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.model(**inputs.to(torch.float16))
 
         # 마지막 히든 스테이트 추출
         last_hidden_states = outputs.last_hidden_state  # shape: (batch_size, sequence_length, hidden_size)
@@ -233,6 +307,7 @@ class VideoFeatureExtractor:
         self.processor = BeitImageProcessor.from_pretrained(model)
         self.model = BeitModel.from_pretrained(model)
         self.model.to(device)
+        self.model.half()
 
     def encode(self, image: Image.Image):
         """
@@ -249,7 +324,7 @@ class VideoFeatureExtractor:
 
         # 모델을 통해 특징 추출
         with torch.no_grad():
-            outputs = self.model(**inputs) # [batch_size, sequence_length, hidden_size]
+            outputs = self.model(**inputs.to(torch.float16)) # [batch_size, sequence_length, hidden_size]
         
         # 최종 특징 벡터 (CLS 토큰 사용)
         features = outputs.last_hidden_state[:, 0, :]
@@ -395,17 +470,6 @@ class AudioFeatureExtractor:
 
         return torch.mean(torch.stack(features), dim=0)
     
-# class MultimodalFeatureExtractor:
-#     def __init__(self):
-#         self.model = ImageBindModel.from_pretrained("nielsr/imagebind-huge")
-
-#     def extract_features(self, text, video_frames_folder, audio_folder):
-#         text_features = self.text_extractor.encode(text)
-#         video_features = self.video_extractor.extract_from_video(video_frames_folder)
-#         audio_features = self.audio_extractor.extract_from_audio_folder(audio_folder)
-
-#         return text_features, video_features, audio_features
-
 def json_to_multi_modal_embedding(json_dir, video_dir, audio_dir, output_dir):
     """
     JSON 파일을 읽어 멀티모달 임베딩을 생성하고 저장합니다.
@@ -859,6 +923,188 @@ def construct_conversation_graph_with_single_global(json_dir, data_dir, output_d
 
         output_path = os.path.join(output_dir,f"{base}_single.pt")
         torch.save(conversation_graph,output_path)
+
+def count_index_nodes(m, n):
+    count = 0
+    current = (m + n - 1) // n  # ⌈m / n⌉
+    while current > 1:
+        print(f"current: {current}")
+        count += current
+        current = (current + n - 1) // n
+    return count + 1  # +1 for the root node
+
+def construct_conversation_graph_with_log(json_dir, data_dir, output_dir,k=5,draw=False):
+    """
+    JSON 파일을 읽어 대화 그래프를 구성하고 저장합니다.
+    
+    Args:
+        json_dir (str): JSON 파일이 저장된 디렉토리
+        output_path (str): 결과를 저장할 파일 경로
+    """
+
+    json_files = sorted([f for f in os.listdir(json_dir) if f.endswith(".json")])
+
+    for json_file in tqdm(json_files, desc="Constructing conversation graph"):
+        conversation_graph = Data()
+        
+        with open(os.path.join(json_dir, json_file), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        data = merge_words_by_speaker(data)
+
+        text_features = []
+        video_features = []
+        audio_features = []
+
+        speaker_num = []
+
+        offset = 0  # 노드 인덱스 오프셋 초기화
+
+        for item in tqdm(data, desc="Processing utterances"):
+            word = item['word']
+            speaker = item['speaker']
+            start = item['start']
+            end = item['end']
+
+            if not word or (end - start) < 1:
+                offset += 1
+                continue
+
+            speaker_num.append(speaker)
+
+            # 텍스트 임베딩
+            with open(os.path.join(data_dir, "text_features", json_file.replace(".json", f"/{speaker}_{start:.2f}_{end:.2f}.pt")), 'rb') as f:
+                text_feature:torch.Tensor = torch.load(f)
+                text_features.append(text_feature)
+
+            # 비디오 임베딩
+            with open(os.path.join(data_dir, "video_features", json_file.replace(".json", f"/{speaker}_{start:.2f}_{end:.2f}.pt")), 'rb') as f:
+                video_feature = torch.load(f)
+                video_features.append(video_feature)
+
+            # 오디오 임베딩
+            with open(os.path.join(data_dir, "audio_features", json_file.replace(".json", f"/{speaker}_{start:.2f}_{end:.2f}.pt")), 'rb') as f:
+                audio_feature = torch.load(f)
+                audio_features.append(audio_feature)
+
+        # 대화 그래프에 노드 추가
+        conversation_graph.x_text = torch.stack(text_features,dim=0)
+        conversation_graph.x_video = torch.stack(video_features,dim=0)
+        conversation_graph.x_audio = torch.stack(audio_features,dim=0)
+        conversation_graph.speaker_num = torch.tensor(speaker_num, dtype=torch.long) if speaker_num else None
+        conversation_graph.global_index = []
+        conversation_graph.speaker_index = []
+
+        node_count = len(text_features)  # 노드 개수
+        
+        speaker_color = [
+    'blue',      # 1
+    'green',     # 2
+    'orange',    # 3
+    'skyblue',   # 4
+    'cyan',      # 5
+    'gold',      # 6
+    'lime',      # 7
+    'brown',     # 8
+    'pink',      # 9
+    'gray'       # 10
+]
+
+        node_color = []
+
+        # 대화 그래프에 Sequential 엣지 추가
+        for idx in range(node_count):
+            node_color.append('red')
+            if idx == 0:
+                continue
+            # 이전 노드와 현재 노드 간의 엣지 추가
+            elif idx == 1:
+                conversation_graph.edge_index = torch.tensor([[idx - 1, idx], [idx, idx - 1]], dtype=torch.long)
+            else:
+                conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, torch.tensor([[idx - 1, idx], [idx, idx - 1]], dtype=torch.long)], dim=1)
+
+        hie_conv_count = count_index_nodes(node_count, k)
+        conversation_graph.x_hie_conv = torch.zeros((hie_conv_count, 768), dtype=torch.float)  # Hierarchical-conversation 노드 임베딩 초기화 (추후 nn.Parameter로 교체 가능)
+
+        conversation_graph.global_index.append(node_count + hie_conv_count - 1)
+
+        # 대화 그래프에 Hierarchical-conversation 엣지 추가
+        edge_index_hie_conv = build_tree_edge_index_log(hie_conv_count, node_count, branch_factor=k)
+
+        # conversation_graph의 edge_index와 edge_index_hie_conv를 연결
+        edge_index_hie_conv = edge_index_hie_conv + node_count # offset  # Hierarchical-conversation 엣지 인덱스에 오프셋 추가
+        conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, edge_index_hie_conv], dim=1)
+
+        for i in range(hie_conv_count):
+            node_color.append('purple')
+
+        for i in range(node_count):
+            ii = i // k
+            conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, torch.tensor([[i], [node_count + ii]], dtype=torch.long)], dim=1)
+            conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, torch.tensor([[node_count + ii], [i]], dtype=torch.long)], dim=1)
+
+        # 대화 그래프에 Hierarchical-speaker 노드 임베딩 초기화
+        # 각 화자마다 노드 개수를 구하고 Hierarchical-conversation과 유사한 방식으로 노드 임베딩을 초기화
+        prev_speaker_num = 0
+        unique_speakers = set(speaker_num)
+        conversation_graph.x_hie_speaker = 0  # Hierarchical-speaker 노드 임베딩 초기화
+
+        for speaker in unique_speakers:
+            speaker_indices = [i for i, s in enumerate(speaker_num) if s == speaker]
+            speaker_node_count = len(speaker_indices)
+            if speaker_node_count < 2:
+                continue
+
+            # Hierarchical-speaker 노드 임베딩 초기화
+            hie_speaker_count = count_index_nodes(speaker_node_count, k)
+            conversation_graph.speaker_index.append(node_count + hie_conv_count + prev_speaker_num + hie_speaker_count - 1)
+
+            if conversation_graph.x_hie_speaker is 0:
+                conversation_graph.x_hie_speaker = torch.zeros((hie_speaker_count, 768), dtype=torch.float)
+            else:
+                conversation_graph.x_hie_speaker = torch.concat([conversation_graph.x_hie_speaker,torch.zeros((hie_speaker_count, 768), dtype=torch.float)], dim=0)  # Hierarchical-speaker 노드 임베딩 초기화 (추후 nn.Parameter로 교체 가능)
+
+            for i in range(hie_speaker_count):
+                # print(speaker)
+                node_color.append(speaker_color[speaker])
+
+            if hie_speaker_count != 1:
+                # Hierarchical-speaker 엣지 추가
+                edge_index_hie_speaker = build_tree_edge_index_log(hie_speaker_count, speaker_node_count, branch_factor=k)
+
+                # conversation_graph의 edge_index와 edge_index_hie_speaker를 연결
+                edge_index_hie_speaker = edge_index_hie_speaker + node_count + hie_conv_count + prev_speaker_num # offset  # Hierarchical-speaker 엣지 인덱스에 오프셋 추가
+                conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, edge_index_hie_speaker], dim=1)
+
+            for i in range(len(speaker_indices)): # s는 현재 화자의 대화 노드 인덱스
+                s = speaker_indices[i]
+                ii = i // k
+                # if i == 0:
+                conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, torch.tensor([[s], [node_count + hie_conv_count + prev_speaker_num + ii]], dtype=torch.long)], dim=1)
+                conversation_graph.edge_index = torch.cat([conversation_graph.edge_index, torch.tensor([[node_count + hie_conv_count + prev_speaker_num + ii], [s]], dtype=torch.long)], dim=1)
+        
+            prev_speaker_num += hie_speaker_count
+
+        if draw:
+            G = nx.DiGraph()
+
+            for edge in conversation_graph.edge_index.t().tolist():
+                G.add_edge(edge[0], edge[1])
+
+            # pos = nx.spring_layout(G)  # 노드 위치 설정
+            net = Network(notebook=False, height='900px', width='100%')
+            net.from_nx(G)
+
+            for node in net.nodes:
+                node["label"] = str(node["id"])  # id를 문자열로 label로 사용
+                node["color"] = node_color[node["id"]]  # 기존 색상 그대로
+                
+            net.show('graph_log.html',notebook=False)
+
+        base = json_file.replace(".json", "")
+
+        output_path = os.path.join(output_dir,f"{base}_log.pt")
+        torch.save(conversation_graph,output_path)
     
 if __name__ == "__main__":
     
@@ -870,6 +1116,6 @@ if __name__ == "__main__":
     
     # json_to_multi_modal_embedding("data/orch","data/video","data/audio","data/processed")
     
-    construct_conversation_graph(json_dir,feature_dir,graph_dir,True)
+    construct_conversation_graph_with_log(json_dir,feature_dir,graph_dir,k=3,draw=True)
 
-    construct_conversation_graph_with_single_global(json_dir,feature_dir,graph_dir)
+    # construct_conversation_graph_with_single_global(json_dir,feature_dir,graph_dir, True)
