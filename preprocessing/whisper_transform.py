@@ -4,7 +4,9 @@ import google.generativeai as genai
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import dotenv
+import torch
 import os
+
 
 dotenv.load_dotenv()
 
@@ -22,8 +24,7 @@ asr_model = whisper.load_model("medium",device='cuda')
 
 # diarization pipeline 불러오기
 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN)
-import torch
-pipeline.to(torch.device("cuda:1"))
+pipeline.to(torch.device("cuda"))
 
 # model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L6-v2",device="cuda:1")
 
