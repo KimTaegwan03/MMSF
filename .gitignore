@@ -3,3 +3,6 @@ data/
 error.log
 temp_audio.wav
 environment.yml
+results/*
+wandb
+*.wav

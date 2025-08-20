@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch_geometric
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 # U = # of Utterance = # of Node
 # D = Vector Dimension
@@ -118,7 +119,9 @@ class VideoUniGraph(nn.Module):
         edge_mask_rate: float = 0.1,
         gamma: float = 2.0,
         lambda_spd: float = 0.5,
+        feat_noise: float = 0.01,
         edge_window: int = 1,
+        dtype: type = torch.float32,
         device:str = 'cuda'
     ):
         super(VideoUniGraph,self).__init__()
@@ -127,67 +130,70 @@ class VideoUniGraph(nn.Module):
         self.edge_mask_rate = edge_mask_rate
         self.gamma = gamma
         self.lambda_spd = lambda_spd
+        self.feat_noise = feat_noise
         self.modals = input_dims.keys()
         self.K = edge_window
         self.device = device
+        self.dtype = dtype
         
         self.modal_projector = nn.ModuleDict([[
-            modal, nn.Linear(input_dims[modal], hidden_dim)
+            modal, nn.Sequential(
+                nn.LayerNorm(input_dims[modal]),
+                nn.Linear(input_dims[modal], hidden_dim),
+                nn.ReLU()
+                ).to(dtype)
         ] for modal in self.modals])
         
         # Mixture of Experts
-        self.moe = MoE(hidden_dim, hidden_dim, num_experts, num_selected_experts)
+        self.moe = MoE(hidden_dim, hidden_dim, num_experts, num_selected_experts).to(dtype)
         
         # GNN layers
         self.gnn_layers = nn.ModuleList([
-            geonn.GATConv(hidden_dim, hidden_dim, heads=4),
-            geonn.GATConv(hidden_dim*4, hidden_dim, heads=4),
-            geonn.GATConv(hidden_dim*4, hidden_dim, heads=4)
-            # for _ in range(num_layers-1)
-        ])
+            geonn.GATv2Conv(hidden_dim, hidden_dim, heads=4, dropout=0.5).to(dtype)] +
+            [geonn.GATv2Conv(hidden_dim*4, hidden_dim, heads=4, dropout=0.5).to(dtype) for _ in range(num_layers-1)]
+        ).to(dtype)
+
+        self.enc_layer = TransformerEncoderLayer(d_model=hidden_dim, nhead=8)
+        self.transformer = TransformerEncoder(self.enc_layer, num_layers=2)
+
+        self.max_len = 4096  # 필요에 맞게
+        self.pos_emb = nn.Embedding(self.max_len, hidden_dim)
+        self.pos_drop = nn.Dropout(0.1)
         
         self.decoder = nn.ModuleDict([[
-            modal, VolatilityDecoder(hidden_dim*4)  # Assuming 4 heads in GATConv
+            modal, VolatilityDecoder(hidden_dim*4).to(dtype)  # Assuming 4 heads in GATConv
         ] for modal in self.modals])
 
         # SPD decoder
-        self.spd_decoder = SPDDecoder(hidden_dim)
+        self.spd_decoder = SPDDecoder(hidden_dim).to(dtype)
+
+        # Google Search Decoder
+        self.entire_decoder = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim*4, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, 1)
+        ).to(dtype)
+
+        self.speaker_decoder = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim*8, hidden_dim*4),
+            nn.LayerNorm(hidden_dim*4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim*4, 1)
+        )
         
         # Mask token
-        self.mask_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
+        self.mask_token = nn.Parameter(torch.zeros(hidden_dim,device=device,dtype=dtype))
         
         # Conv Vertex
-        self.x_hie_conv_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
+        self.x_hie_conv_token = nn.Parameter(torch.zeros(hidden_dim,device=device,dtype=dtype))
 
         # Speaker Vertex
-        self.x_hie_speaker_token = nn.Parameter(torch.randn(hidden_dim,dtype=torch.float32)).to(self.device)
-
-    def construct_conversation_graph(
-        self,
-        x: torch.Tensor,
-        K: int
-    ):
-        edge = []
-        len_spmap = x.shape[0]
-        
-        # Sequencial Edge (Window Size = K)
-        for i in range(len_spmap):
-            for j in range(i-K,i-K+1):
-                if j > 0 and j < len_spmap:
-                    edge.append([i,j])
-                    
-        # Global Edge
-        for i in range(len_spmap):
-            edge.append([len_spmap,i])
-            edge.append([i,len_spmap])
-            
-        edge_t = torch.Tensor(np.transpose(edge)).to(int).to(self.device)
-        
-        vertex = torch.concat([x,self.global_vertex])
-        
-        graph_data = Data(vertex, edge_t)
-        
-        return graph_data
+        self.x_hie_speaker_token = nn.Parameter(torch.zeros(hidden_dim,device=device,dtype=dtype))
 
     def _mask_features(
         self,
@@ -206,7 +212,7 @@ class VideoUniGraph(nn.Module):
         
         # Apply mask
         masked_features = features.clone()
-        masked_features[mask] = self.mask_token
+        masked_features[mask] = self.mask_token.to(masked_features.dtype)
         
         return masked_features, mask
     
@@ -232,92 +238,140 @@ class VideoUniGraph(nn.Module):
         graph: Data,  # Graph data structure
         # spmap: List,
         spd_matrix: Optional[torch.Tensor] = None,
-        return_embeddings: bool = False
+        return_embeddings: bool = False,
+        decoding: bool = False,
+        all = True
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         
-        proj = {}
-        
-        for modal, f in features.items():
-            proj[modal] = self.modal_projector[modal](f)
-        
-        # Average features across modalities
-        x = torch.stack(list(proj.values())).mean(dim=0)
-        
-        # Mask features
-        masked_x, mask = self._mask_features(x, self.feat_drop_rate)
-        
-        # Apply MoE
-        aligned_x = self.moe(masked_x)
-        
-        # graph = self.construct_conversation_graph(aligned_x, self.K)
-
-        # Apply GNN layers
-        x_hie_conv = self.x_hie_conv_token.unsqueeze(0).repeat(graph.x_hie_conv.size(0), 1)      # [hie_conv_count, 768]
-        x_hie_speaker = self.x_hie_speaker_token.unsqueeze(0).repeat(graph.x_hie_speaker.size(0), 1)  # [hie_speaker_count, 768]
-
-        h = torch.concat([aligned_x,x_hie_conv.unsqueeze(1),x_hie_speaker.unsqueeze(1)], dim=0).squeeze(1)
-
-        print("Initial h shape:", h.shape)
-
-        for layer in self.gnn_layers:
-            h = layer(h, graph.edge_index)
-        
-        print("After GNN layers, h shape:", h.shape)
-
-        res = {
-                "conversation_embeddings": h[:aligned_x.size(0),:],  # Exclude hierarchical nodes
-                "global_embeddings": h[graph.global_index[0]:graph.global_index[0]+1,:], # Global node embedding
-                "speaker_embeddings": h[graph.speaker_index,:]
-            }
+        if all:
+            proj = {}
             
-        if return_embeddings:
-            return res
+            for modal, f in features.items():
+                # if self.training and self.feat_noise > 0:
+                #     noise = torch.randn_like(f) * self.feat_noise
+                #     f = f + noise
+                proj[modal] = self.modal_projector[modal](f.to(self.dtype))
+                # proj[modal] = f.to(self.dtype)
             
-        # Reconstruct features for each domain
-        reconstruction_loss = 0
-        for domain, decoder in self.decoder.items():
-            reconstructed = decoder(h[:aligned_x.size(0),:][mask])
-            original = features[domain][mask]
-            similarity = F.cosine_similarity(reconstructed, original, dim=-1)
-            reconstruction_loss += (1 - similarity).pow(self.gamma).mean()
+            # Average features across modalities
+            x = torch.stack(list(proj.values())).mean(dim=0)
             
-        # Compute SPD loss if provided
-        spd_loss = 0
-        if spd_matrix is not None:
-            spd_loss = self._compute_spd_loss(h, spd_matrix)
+            # Mask features
+            # masked_x, mask = self._mask_features(x, self.feat_drop_rate)
             
-        # Combine losses
-        total_loss = reconstruction_loss + self.lambda_spd * spd_loss
-        
-        return total_loss, res
+            # Apply MoE
+            # aligned_x = self.moe(x)
+            aligned_x = x
+            
+            # Apply GNN layers
+            # Initialize with avg of utt features
+            # x_hie_conv = aligned_x.mean(dim=0).repeat(graph.x_hie_conv.size(0), 1)
+            # x_hie_speaker = aligned_x.mean(dim=0).repeat(graph.x_hie_speaker.size(0), 1)
+
+            # Initialize with zero vector
+            x_hie_conv = self.x_hie_conv_token.unsqueeze(0).repeat(graph.x_hie_conv.size(0), 1)      # [hie_conv_count, 768]
+            x_hie_speaker = self.x_hie_speaker_token.unsqueeze(0).repeat(graph.x_hie_speaker.size(0), 1)  # [hie_speaker_count, 768]
+
+            h = torch.concat([aligned_x.view((-1,self.hidden_dim)),x_hie_conv.view((-1,self.hidden_dim)),x_hie_speaker.view((-1,self.hidden_dim))], dim=0).squeeze(1)
+
+            for layer in self.gnn_layers:
+                h = layer(h, graph.edge_index)
+
+            res = {
+                    "conversation_embeddings": h[:aligned_x.size(0),:],  # Exclude hierarchical nodes
+                    "global_embeddings": h[graph.global_index[0][0]:graph.global_index[0][0]+1,:], # Global node embedding
+                    "speaker_embeddings": h[graph.speaker_index,:]
+                }
+            
+            # out = self.transformer(res['conversation_embeddings'].unsqueeze(1)) # [num_nodes, 1, hidden_dim]
+            # out = self.transformer(x)
+            # summary = out.mean(dim=0)
+                
+            if return_embeddings:
+                return summary
+            
+            if decoding:
+                # z = self.entire_decoder(summary)
+                z = self.entire_decoder(res['global_embeddings'])
+                # z = self.entire_decoder(torch.mean(res['conversation_embeddings'],dim=0))
+                return z
+                
+            # Reconstruct features for each domain
+            reconstruction_loss = 0
+            for domain, decoder in self.decoder.items():
+                reconstructed = decoder(h[:aligned_x.size(0),:])
+                original = features[domain]
+                similarity = F.cosine_similarity(reconstructed, original, dim=-1)
+                reconstruction_loss += (1 - similarity).pow(self.gamma).mean()
+                
+            # Compute SPD loss if provided
+            spd_loss = 0
+            if spd_matrix is not None:
+                spd_loss = self._compute_spd_loss(h, spd_matrix)
+                
+            # Combine losses
+            total_loss = reconstruction_loss + self.lambda_spd * spd_loss
+            
+            return total_loss, res
+        else:
+            proj = {}
+            for modal, f in features.items():
+                proj[modal] = self.modal_projector[modal](f.to(self.dtype))
+            
+            # Average features across modalities
+            x = torch.stack(list(proj.values())).mean(dim=0)
+
+            S = x.size(0)
+            pos_ids = torch.arange(S, device=x.device).unsqueeze(0)   # (1, S)
+            x = x + self.pos_emb(pos_ids)                             # 위치정보 주입
+            x = self.pos_drop(x)
+
+            aligned_x = self.transformer(x)
+            aligned_x = aligned_x.squeeze(0)
+
+            # Initialize with zero vector
+            x_hie_conv = self.x_hie_conv_token.unsqueeze(0).repeat(graph.x_hie_conv.size(0), 1)      # [hie_conv_count, 768]
+            x_hie_speaker = self.x_hie_speaker_token.unsqueeze(0).repeat(graph.x_hie_speaker.size(0), 1)  # [hie_speaker_count, 768]
+
+            h = torch.concat([aligned_x.view((-1,self.hidden_dim)),x_hie_conv.view((-1,self.hidden_dim)),x_hie_speaker.view((-1,self.hidden_dim))], dim=0).squeeze(1)
+
+            for layer in self.gnn_layers:
+                h = layer(h, graph.edge_index)
+
+            res = {
+                    "conversation_embeddings": h[:aligned_x.size(0),:],  # Exclude hierarchical nodes
+                    "global_embeddings": h[graph.global_index[0][0]:graph.global_index[0][0]+1,:], # Global node embedding
+                    "speaker_embeddings": h[graph.speaker_index,:].view(-1,self.hidden_dim*4)
+                }
+            
+            if decoding:
+                output = {}
+                for i, si in enumerate(graph.speaker_annotation.keys()):
+                    z = self.speaker_decoder(torch.concat((res["global_embeddings"].view(-1),res["speaker_embeddings"][i,:].view(-1)),dim=-1))
+                    output[graph.speaker_annotation[si][0]] = z
+                return output
 
 
 if __name__ == "__main__":
+    import torch
+
     model = VideoUniGraph(
-        input_dims={
-            "text": 768,
-            "video": 768,
-            "audio": 768
-        },
-        device='cpu'
-    )
+        {'sentence':768},
+        hidden_dim=256,
+        num_layers=2,
+        feat_noise=0.01,
+        dtype = torch.float32
+    ).to('cuda')
 
-
-    graph = torch.load('data/graph/trump_single.pt',map_location=torch.device('cpu'))
+    graph = torch.load('/mnt/share65/emb/graph/log/HJWHgGJMYCM.pt',map_location=torch.device('cuda'))
 
     # Print datatypes and shapes of graph features
-    print("x_text dtype:", graph.x_text.dtype, "\tshape:", graph.x_text.shape)
-    print("x_video dtype:", graph.x_video.dtype, "\tshape:", graph.x_video.shape)
-    print("x_audio dtype:", graph.x_audio.dtype, "\tshape:", graph.x_audio.shape)
 
     pred = model.forward(
-        features={
-            "text": graph.x_text,
-            "video": graph.x_video,
-            "audio": graph.x_audio.to(torch.float32)
-        },
+        features=graph.x,
         graph=graph,
-        return_embeddings=False
+        decoding=True,
+        all=False
     )
 
     print(pred)

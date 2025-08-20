@@ -5,6 +5,7 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 import subprocess
+import sqlite3
 
 import logging
 import traceback
@@ -65,6 +66,8 @@ if __name__ == "__main__":
     os.makedirs("data/sd",exist_ok=True)
     os.makedirs("data/orch",exist_ok=True)
 
+    db_path = "/mnt/share65/speech_segments.db"
+
     video_dir = "/mnt/share65/videos"
     json_dir = "/mnt/share65/orch_jsons"
     asr_dir = "/mnt/share65/asr"
@@ -74,17 +77,21 @@ if __name__ == "__main__":
     os.makedirs(asr_dir,exist_ok=True)
     os.makedirs(sd_dir,exist_ok=True)
 
-    video_list = os.listdir(video_dir)
+    conn = sqlite3.connect(db_path)
+
+    df = pd.read_sql_query("SELECT video_id FROM video_metadata ORDER BY video_id", conn)
+
+    video_list = df['video_id'].to_list()
     video_list.sort()
 
     for file in tqdm(video_list,desc="Processing Video..."):
 
         try:
-            if not file.endswith(".mp4"):
-                continue
+            # if not file.endswith(".mp4"):
+            #     continue
 
-            input_video = video_dir + "/" + file
-            basename = file.replace(".mp4","")
+            input_video = video_dir + "/" + file + ".mp4"
+            basename = file #.replace(".mp4","")
 
             if os.path.exists(os.path.join(json_dir,f"{basename}.json")):
                 continue
